@@ -3,6 +3,7 @@ import re
 import numpy as np
 import scipy.stats
 from scipy.special import erfinv
+import torch
 
 from .base import Prior, PriorException
 from ..utils import logger, infer_args_from_method, get_dict_with_properties
@@ -725,7 +726,106 @@ class MultivariateGaussianDist(BaseJointPriorDist):
 class MultivariateNormalDist(MultivariateGaussianDist):
     """A synonym for the :class:`~bilby.core.prior.MultivariateGaussianDist` distribution."""
 
+class ZukoJointPrior(BaseJointPriorDist):
+    def __init__(
+        self, 
+        names, 
+        bounds, 
+        flow, 
+        data_bounds
+    ):
+        super(ZukoJointPrior, self).__init__(
+            names=names, 
+            bounds=bounds
+        )
 
+        """
+        A class defining a prior through a normalizing flow 
+
+        Parameters
+        ==========
+        names: list
+            A list of the parameter names used during training of the flow. 
+            The listed parameters must have the same order that they appear in
+            the lists of bounds and data_bounds
+        bounds: list
+            A list specifying the physically allowed range for sampling. 
+            Must be in the form Nx2, where M is the number of parameters
+        flow: pythorch object
+            The normalizing flow trained to sample from the posterior
+        data_bounds: list
+            A list containing the maximum and minimum values of the parameters 
+            in the dataset used for training the flow. Necessary to rescale 
+            the samples. Must be in the form Nx2, where M is the number of parameters 
+        """
+
+    
+        self.flow = flow
+        self.data_bounds = data_bounds
+        self.data_min = self.data_bounds[:,0]
+        self.data_max = self.data_bounds[:,1]
+
+
+    def _sample(self,size):
+
+        samps = np.zeros((size, len(self)))
+        for i in range(size):
+            inbound = False
+            while not inbound:
+                # sample from zuko flow and rescale samples
+                vals = self.flow().sample((1,)).numpy()
+                samp = self._rescale(vals)[0]
+
+                #print(np.atleast_1d(samp))
+                samps[i, :] = np.atleast_1d(samp)
+
+                # check sample is in bounds (otherwise perform another draw)
+                outbound = False
+                for name, val in zip(self.names, samp):                    
+                    if val < self.bounds[name][0] or val > self.bounds[name][1]:
+                        outbound = True
+                        break
+
+                if not outbound:
+                    inbound = True
+
+        return samps
+    
+    
+    def _rescale(self,val):
+        '''
+        Rescale data from unit cube to physical values
+        '''
+        ymin = self.data_min
+        ymax = self.data_max
+
+        return val*(ymax-ymin) + ymin
+    
+    
+    def _normalize(self,val):
+        '''
+        Normalize data to unit cube
+        '''
+        ymin = self.data_min
+        ymax = self.data_max
+                          
+        val_norm = (val - ymin)/(ymax - ymin)
+
+        return val_norm
+
+    
+    def _ln_prob(self,samp,lnprob,outbounds):
+        for j in range(samp.shape[0]):
+            with torch.no_grad():   #don't need to backpropagate -> this allows to output logprobs as numpy
+                samp_norm = self._normalize(samp[j])
+                samp_tensor = torch.as_tensor(samp_norm, dtype=torch.float32)
+                lnprob[j] = self.flow().log_prob(samp_tensor)
+        
+        # set out-of-bounds values to -inf
+        lnprob[outbounds] = -np.inf
+        
+        return lnprob
+    
 class JointPrior(Prior):
     def __init__(self, dist, name=None, latex_label=None, unit=None):
         """This defines the single parameter Prior object for parameters that belong to a JointPriorDist
