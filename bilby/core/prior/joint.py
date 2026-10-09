@@ -213,6 +213,8 @@ class BaseJointPriorDist(object):
         outbounds = np.ones(samp.shape[0], dtype=bool)
         for s, bound in zip(samp.T, self.bounds.values()):
             outbounds = (s < bound[0]) | (s > bound[1])
+            #print('sample: ', s)
+            #print('bounds: ', bound[0], ', ', bound[1], '\n')
             if np.any(outbounds):
                 break
         return samp, outbounds
@@ -229,6 +231,9 @@ class BaseJointPriorDist(object):
             NxM, where N is the number of samples and M is the number of
             parameters.
         """
+
+        # samp does not make sense, it seems like it's inverted
+        #print('value passed: ', value)
 
         samp, outbounds = self._check_samp(value)
         lnprob = -np.inf * np.ones(samp.shape[0])
@@ -280,6 +285,8 @@ class BaseJointPriorDist(object):
                 self.current_sample[name] = samps[:, i].flatten()[0]
             else:
                 self.current_sample[name] = samps[:, i].flatten()
+
+        #print('sample, from sample method:', samps)
 
     def _sample(self, size, **kwargs):
         """
@@ -630,6 +637,8 @@ class MultivariateGaussianDist(BaseJointPriorDist):
         samp = self.mus[mode] + self.sigmas[mode] * np.einsum(
             "ij,kj->ik", samp * self.sqeigvalues[mode], self.eigvectors[mode]
         )
+
+        #print('rescaled sample', samp)
         return samp
 
     def _sample(self, size, **kwargs):
@@ -727,103 +736,62 @@ class MultivariateNormalDist(MultivariateGaussianDist):
     """A synonym for the :class:`~bilby.core.prior.MultivariateGaussianDist` distribution."""
 
 class ZukoJointPrior(BaseJointPriorDist):
-    def __init__(
-        self, 
-        names, 
-        bounds, 
-        flow, 
-        data_bounds
-    ):
-        super(ZukoJointPrior, self).__init__(
-            names=names, 
-            bounds=bounds
-        )
 
+    def __init__(self, names, bounds, flow, data_bounds, B=5.0):
+        super(ZukoJointPrior, self).__init__(names=names, bounds=bounds)
         """
-        A class defining a prior through a normalizing flow 
-
-        Parameters
-        ==========
-        names: list
-            A list of the parameter names used during training of the flow. 
-            The listed parameters must have the same order that they appear in
-            the lists of bounds and data_bounds
-        bounds: list
-            A list specifying the physically allowed range for sampling. 
-            Must be in the form Nx2, where M is the number of parameters
-        flow: pythorch object
-            The normalizing flow trained to sample from the posterior
-        data_bounds: list
-            A list containing the maximum and minimum values of the parameters 
-            in the dataset used for training the flow. Necessary to rescale 
-            the samples. Must be in the form Nx2, where M is the number of parameters 
+        names: parameter names, same order as bounds / data_bounds
+        bounds: physical range for sampling, Nx2. MUST equal data_bounds, otherwise
+            the flow mass outside `bounds` is lost and the prior is no longer normalized.
+        flow: zuko NSF with a BoxUniform base on [-B, B]^D
+        data_bounds: the (padded) lo/hi used to rescale the training data to [-B, B], Nx2
+        B: half-width of the spline / base domain used in training
         """
-
-    
         self.flow = flow
+        self.flow_dist = self.flow()
         self.data_bounds = data_bounds
-        self.data_min = self.data_bounds[:,0]
-        self.data_max = self.data_bounds[:,1]
+        self.data_min = self.data_bounds[:, 0]
+        self.data_max = self.data_bounds[:, 1]
+        self.B = B
 
+    def _sample(self, size):
+        with torch.no_grad():
+            vals = self.flow_dist.sample((size,)).cpu().numpy()
+        samps = self._denormalize(vals)
+        # support is the box by construction; clip only removes float32 round-off (~1e-6)
+        return np.clip(samps, self.data_min, self.data_max)
 
-    def _sample(self,size):
-
-        samps = np.zeros((size, len(self)))
-        for i in range(size):
-            inbound = False
-            while not inbound:
-                # sample from zuko flow and rescale samples
-                vals = self.flow().sample((1,)).numpy()
-                samp = self._rescale(vals)[0]
-
-                #print(np.atleast_1d(samp))
-                samps[i, :] = np.atleast_1d(samp)
-
-                # check sample is in bounds (otherwise perform another draw)
-                outbound = False
-                for name, val in zip(self.names, samp):                    
-                    if val < self.bounds[name][0] or val > self.bounds[name][1]:
-                        outbound = True
-                        break
-
-                if not outbound:
-                    inbound = True
-
-        return samps
-    
-    
-    def _rescale(self,val):
+    def _rescale(self, val, **kwargs):
         '''
-        Rescale data from unit cube to physical values
+        Quantile function for bilby/dynesty: unit cube -> physical samples.
+        The base is uniform on [-B, B]^D, so the unit cube maps to it by an affine map.
         '''
-        ymin = self.data_min
-        ymax = self.data_max
+        val = np.atleast_2d(val)
+        z = torch.as_tensor(val * 2 * self.B - self.B, dtype=torch.float32)
 
-        return val*(ymax-ymin) + ymin
-    
-    
-    def _normalize(self,val):
-        '''
-        Normalize data to unit cube
-        '''
-        ymin = self.data_min
-        ymax = self.data_max
-                          
-        val_norm = (val - ymin)/(ymax - ymin)
+        with torch.no_grad():
+            x_scaled = self.flow_dist.transform.inv(z).cpu().numpy()
 
-        return val_norm
+        samps = self._denormalize(x_scaled)
+        return np.clip(samps, self.data_min, self.data_max)   # float round-off only --> no rejection
 
-    
-    def _ln_prob(self,samp,lnprob,outbounds):
-        for j in range(samp.shape[0]):
-            with torch.no_grad():   #don't need to backpropagate -> this allows to output logprobs as numpy
-                samp_norm = self._normalize(samp[j])
-                samp_tensor = torch.as_tensor(samp_norm, dtype=torch.float32)
-                lnprob[j] = self.flow().log_prob(samp_tensor)
-        
-        # set out-of-bounds values to -inf
-        lnprob[outbounds] = -np.inf
-        
+    def _normalize(self, val):
+        '''physical sample -> [-B, B]'''
+        return (val - self.data_min) / (self.data_max - self.data_min) * 2 * self.B - self.B
+
+    def _denormalize(self, val_scaled):
+        '''[-B, B] -> physical sample (inverse of _normalize)'''
+        return (val_scaled + self.B) / (2 * self.B) * (self.data_max - self.data_min) + self.data_min
+
+    def _ln_prob(self, samp, lnprob, outbounds):
+        ok = ~np.asarray(outbounds)
+        if ok.any():
+            x = torch.as_tensor(self._normalize(samp[ok]), dtype=torch.float32)
+            with torch.no_grad():
+                lp = self.flow_dist.log_prob(x).cpu().numpy()
+            log_jac = np.log((self.data_max - self.data_min) / (2 * self.B)).sum()
+            lnprob[ok] = lp - log_jac
+        lnprob[~ok] = -np.inf   # out-of-bounds: avoid evaluating log_prob off the base support
         return lnprob
     
 class JointPrior(Prior):
@@ -929,7 +897,7 @@ class JointPrior(Prior):
 
         if len(self.dist.current_sample) == 0:
             # generate a sample
-            self.dist.sample(size=size, **kwargs)
+            self.dist.sample(size=size, **kwargs) # shape(1, n_params)
 
         sample = self.dist.current_sample[self.name]
 
@@ -940,7 +908,7 @@ class JointPrior(Prior):
             # reset samples
             self.dist.reset_sampled()
         self.least_recently_sampled = sample
-        return sample
+        return sample 
 
     def ln_prob(self, val):
         """
