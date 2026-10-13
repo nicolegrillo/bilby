@@ -737,29 +737,42 @@ class MultivariateNormalDist(MultivariateGaussianDist):
 
 class ZukoJointPrior(BaseJointPriorDist):
 
-    def __init__(self, names, bounds, flow, data_bounds, B=5.0):
+    def __init__(self, names, bounds, flow, data_bounds, B=5.0, log_mask=None):
         super(ZukoJointPrior, self).__init__(names=names, bounds=bounds)
         """
         names: parameter names, same order as bounds / data_bounds
-        bounds: physical range for sampling, Nx2. MUST equal data_bounds, otherwise
-            the flow mass outside `bounds` is lost and the prior is no longer normalized.
+        bounds: physical range for sampling, Nx2. Flow mass outside `bounds` is lost,
+            so the prior is the flow truncated to `bounds` (not renormalized).
         flow: zuko NSF with a BoxUniform base on [-B, B]^D
-        data_bounds: the (padded) lo/hi used to rescale the training data to [-B, B], Nx2
+        data_bounds: the (padded) lo/hi used to rescale the training data to [-B, B], Nx2,
+            given in the training space (i.e. log(x) for the dimensions in log_mask)
         B: half-width of the spline / base domain used in training
+        log_mask: boolean array of length D, True for the dimensions the flow was trained
+            on in log space. Default: no log dimensions.
         """
         self.flow = flow
         self.flow_dist = self.flow()
-        self.data_bounds = data_bounds
+        self.data_bounds = np.asarray(data_bounds)
         self.data_min = self.data_bounds[:, 0]
         self.data_max = self.data_bounds[:, 1]
         self.B = B
+        if log_mask is None:
+            log_mask = np.zeros(len(names), dtype=bool)
+        self.log_mask = np.asarray(log_mask, dtype=bool)
 
     def _sample(self, size):
-        with torch.no_grad():
-            vals = self.flow_dist.sample((size,)).cpu().numpy()
-        samps = self._denormalize(vals)
-        # support is the box by construction; clip only removes float32 round-off (~1e-6)
-        return np.clip(samps, self.data_min, self.data_max)
+        # the flow support is the (padded) data box, which can extend beyond the
+        # physical sampling bounds: reject those draws
+        lo = np.array([self.bounds[name][0] for name in self.names])
+        hi = np.array([self.bounds[name][1] for name in self.names])
+        samps = np.empty((0, len(self.names)))
+        while len(samps) < size:
+            with torch.no_grad():
+                vals = self.flow_dist.sample((size,)).cpu().numpy()
+            new = self._denormalize(vals)
+            inbound = np.all((new >= lo) & (new <= hi), axis=1)
+            samps = np.concatenate([samps, new[inbound]])
+        return samps[:size]
 
     def _rescale(self, val, **kwargs):
         '''
@@ -772,16 +785,19 @@ class ZukoJointPrior(BaseJointPriorDist):
         with torch.no_grad():
             x_scaled = self.flow_dist.transform.inv(z).cpu().numpy()
 
-        samps = self._denormalize(x_scaled)
-        return np.clip(samps, self.data_min, self.data_max)   # float round-off only --> no rejection
+        return self._denormalize(x_scaled)
 
     def _normalize(self, val):
         '''physical sample -> [-B, B]'''
+        val = np.where(self.log_mask, np.log(np.where(self.log_mask, val, 1.0)), val)
         return (val - self.data_min) / (self.data_max - self.data_min) * 2 * self.B - self.B
 
     def _denormalize(self, val_scaled):
         '''[-B, B] -> physical sample (inverse of _normalize)'''
-        return (val_scaled + self.B) / (2 * self.B) * (self.data_max - self.data_min) + self.data_min
+        val = (val_scaled + self.B) / (2 * self.B) * (self.data_max - self.data_min) + self.data_min
+        # clip only removes float32 round-off (~1e-6) --> no rejection
+        val = np.clip(val, self.data_min, self.data_max)
+        return np.where(self.log_mask, np.exp(val), val)
 
     def _ln_prob(self, samp, lnprob, outbounds):
         ok = ~np.asarray(outbounds)
@@ -790,10 +806,12 @@ class ZukoJointPrior(BaseJointPriorDist):
             with torch.no_grad():
                 lp = self.flow_dist.log_prob(x).cpu().numpy()
             log_jac = np.log((self.data_max - self.data_min) / (2 * self.B)).sum()
-            lnprob[ok] = lp - log_jac
+            # p(x) = p(log x) / x for the log dimensions
+            log_jac_log = np.log(samp[ok][:, self.log_mask]).sum(axis=1)
+            lnprob[ok] = lp - log_jac - log_jac_log
         lnprob[~ok] = -np.inf   # out-of-bounds: avoid evaluating log_prob off the base support
         return lnprob
-    
+
 class JointPrior(Prior):
     def __init__(self, dist, name=None, latex_label=None, unit=None):
         """This defines the single parameter Prior object for parameters that belong to a JointPriorDist
