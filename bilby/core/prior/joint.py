@@ -789,7 +789,8 @@ class ZukoJointPrior(BaseJointPriorDist):
 
     def _normalize(self, val):
         '''physical sample -> [-B, B]'''
-        val = np.where(self.log_mask, np.log(np.where(self.log_mask, val, 1.0)), val)
+        val = np.array(val, dtype=float)
+        val[..., self.log_mask] = np.log(val[..., self.log_mask])
         return (val - self.data_min) / (self.data_max - self.data_min) * 2 * self.B - self.B
 
     def _denormalize(self, val_scaled):
@@ -797,7 +798,8 @@ class ZukoJointPrior(BaseJointPriorDist):
         val = (val_scaled + self.B) / (2 * self.B) * (self.data_max - self.data_min) + self.data_min
         # clip only removes float32 round-off (~1e-6) --> no rejection
         val = np.clip(val, self.data_min, self.data_max)
-        return np.where(self.log_mask, np.exp(val), val)
+        val[..., self.log_mask] = np.exp(val[..., self.log_mask])
+        return val
 
     def _ln_prob(self, samp, lnprob, outbounds):
         ok = ~np.asarray(outbounds)
