@@ -2,7 +2,7 @@ import re
 
 import numpy as np
 import scipy.stats
-from scipy.special import erfinv
+from scipy.special import erfinv, expit
 import torch
 
 from .base import Prior, PriorException
@@ -813,6 +813,99 @@ class ZukoJointPrior(BaseJointPriorDist):
             lnprob[ok] = lp - log_jac - log_jac_log
         lnprob[~ok] = -np.inf   # out-of-bounds: avoid evaluating log_prob off the base support
         return lnprob
+
+class ZukoJointPriorTransformed(BaseJointPriorDist):
+    """
+    Prior from a zuko NSF with a BoxUniform base on [-B, B]^D, trained on y = T(x).
+
+    names:    parameter names (physical), same order as the flow dimensions
+    flow:     zuko NSF, BoxUniform base on [-B, B]^D
+    kinds:    list of "logit" | "log", one per parameter
+    y_bounds: Dx2 array, the padded (lo, hi) in y-space used to rescale the training data to [-B, B]
+    B:        half-width of the spline / base domain used in training
+
+    The physical bounds are T^-1(y_bounds): 0 < q < 1, Mc > 0, dL > 0 by construction.
+    The prior volume is exactly 1 (the flow is a bijection of the box), so no ln Z correction is needed.
+    """
+
+    def __init__(self, names, flow, kinds, y_bounds, B=5.0):
+        self.kinds = list(kinds)
+        self.y_bounds = np.asarray(y_bounds, dtype=float)   # also needed by bilby's prior repr
+        self.y_min = self.y_bounds[:, 0]
+        self.y_max = self.y_bounds[:, 1]
+        self.B = B
+        bounds = [tuple(b) for b in np.stack([self._from_y(self.y_min), self._from_y(self.y_max)], axis=1)]
+        super().__init__(names=names, bounds=bounds)
+        self.flow = flow
+        self.flow_dist = self.flow()
+        # constant part of the Jacobian, y -> s
+        self._log_ds_dy = np.log(2 * self.B / (self.y_max - self.y_min)).sum()
+
+    # ---- x <-> y ---------------------------------------------------------------------
+    def _to_y(self, x):
+        x = np.asarray(x, dtype=float)
+        y = np.empty_like(x)
+        for i, k in enumerate(self.kinds):
+            y[..., i] = np.log(x[..., i] / (1 - x[..., i])) if k == "logit" else np.log(x[..., i])
+        return y
+
+    def _from_y(self, y):
+        y = np.asarray(y, dtype=float)
+        x = np.empty_like(y)
+        for i, k in enumerate(self.kinds):
+            x[..., i] = expit(y[..., i]) if k == "logit" else np.exp(y[..., i])
+        return x
+
+    def _log_dydx(self, x):
+        """sum_i ln |dy_i/dx_i|, evaluated at physical x"""
+        x = np.asarray(x, dtype=float)
+        out = np.zeros(x.shape[:-1])
+        for i, k in enumerate(self.kinds):
+            out -= (np.log(x[..., i]) + np.log1p(-x[..., i])) if k == "logit" else np.log(x[..., i])
+        return out
+
+    # ---- y <-> s (flow coordinates in [-B, B]) -----------------------------------------
+    def _y_to_s(self, y):
+        return (y - self.y_min) / (self.y_max - self.y_min) * 2 * self.B - self.B
+
+    def _s_to_y(self, s):
+        s = np.clip(s, -self.B, self.B)   # float32 round-off only
+        return (s + self.B) / (2 * self.B) * (self.y_max - self.y_min) + self.y_min
+
+    def _normalize(self, x):
+        """physical -> flow coordinates"""
+        return self._y_to_s(self._to_y(x))
+
+    def _denormalize(self, s):
+        """flow coordinates -> physical"""
+        return self._from_y(self._s_to_y(s))
+
+    # ---- bilby interface ---------------------------------------------------------------
+    def _sample(self, size, **kwargs):
+        with torch.no_grad():
+            s = self.flow_dist.sample((size,)).cpu().numpy()
+        return self._denormalize(s)
+
+    def _rescale(self, val, **kwargs):
+        """unit cube [0,1]^D -> physical samples (quantile function for dynesty)"""
+        val = np.atleast_2d(val)
+        z = torch.as_tensor(val * 2 * self.B - self.B, dtype=torch.float32)   # uniform base: affine map
+        with torch.no_grad():
+            s = self.flow_dist.transform.inv(z).cpu().numpy()
+        return self._denormalize(s)
+
+    def _ln_prob(self, samp, lnprob, outbounds):
+        samp = np.atleast_2d(samp)
+        ok = ~np.asarray(outbounds, dtype=bool)
+        lnprob[:] = -np.inf   # out-of-bounds: do not evaluate log_prob off the base support
+        if ok.any():
+            x = samp[ok]
+            s = torch.as_tensor(self._normalize(x), dtype=torch.float32)
+            with torch.no_grad():
+                lp = self.flow_dist.log_prob(s).cpu().numpy()
+            lnprob[ok] = lp + self._log_ds_dy + self._log_dydx(x)
+        return lnprob
+
 
 class JointPrior(Prior):
     def __init__(self, dist, name=None, latex_label=None, unit=None):
